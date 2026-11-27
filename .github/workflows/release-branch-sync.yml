@@ -1,9 +1,10 @@
-name: Sync master into release branches
+name: Sync release branches with their base
 
 on:
   push:
     branches:
       - main
+      - "RELEASE-*"
 
 concurrency:
   group: ${{ github.workflow }}
@@ -20,44 +21,52 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
+      PUSHED_BRANCH: ${{ github.ref_name }}
     steps:
-      - name: Merge main into open release PRs and approve their checks
+      - name: Merge each base into its open release PRs and approve their checks
         run: |
           set -uo pipefail
           failed=0
           declare -A merged
+          declare -A visited
+          queue=("$PUSHED_BRANCH")
 
-          prs=$(gh pr list --base main --state open --limit 100 \
-            --json number,headRefName,isCrossRepository \
-            -q '.[] | select(.isCrossRepository | not) | select(.headRefName | startswith("RELEASE-")) | "\(.number) \(.headRefName)"')
+          while [ ${#queue[@]} -gt 0 ]; do
+            base=${queue[0]}
+            queue=("${queue[@]:1}")
+            [ -n "${visited[$base]:-}" ] && continue
+            visited[$base]=1
 
-          if [ -z "$prs" ]; then
-            echo "No open RELEASE-* pull requests into main"
-            exit 0
-          fi
+            prs=$(gh pr list --base "$base" --state open --limit 100 \
+              --json number,headRefName,isCrossRepository \
+              -q '.[] | select(.isCrossRepository | not) | select(.headRefName | startswith("RELEASE-")) | "\(.number) \(.headRefName)"')
 
-          while read -r pr branch; do
-            if ! response=$(gh api -X POST "repos/$GH_REPO/merges" \
-                -f base="$branch" -f head=main \
-                -f commit_message="Merge branch 'main' into $branch" 2>&1); then
-              if [[ "$response" == *"Merge conflict"* ]]; then
-                echo "::warning::$branch (#$pr) conflicts with main and must be updated manually"
-              else
-                echo "::error::$branch (#$pr) could not be updated: $response"
-                failed=1
+            while read -r pr branch; do
+              [ -z "$pr" ] && continue
+
+              if ! response=$(gh api -X POST "repos/$GH_REPO/merges" \
+                  -f base="$branch" -f head="$base" \
+                  -f commit_message="Merge branch '$base' into $branch" 2>&1); then
+                if [[ "$response" == *"Merge conflict"* ]]; then
+                  echo "::warning::$branch (#$pr) conflicts with $base and must be updated manually"
+                else
+                  echo "::error::$branch (#$pr) could not be updated from $base: $response"
+                  failed=1
+                fi
+                continue
               fi
-              continue
-            fi
 
-            sha=$(jq -r '.sha // empty' <<<"$response")
-            if [ -z "$sha" ]; then
-              echo "$branch (#$pr) is already up to date with main"
-              continue
-            fi
+              sha=$(jq -r '.sha // empty' <<<"$response")
+              if [ -z "$sha" ]; then
+                echo "$branch (#$pr) is already up to date with $base"
+                continue
+              fi
 
-            echo "Merged main into $branch (#$pr) as $sha"
-            merged[$sha]=$branch
-          done <<<"$prs"
+              echo "Merged $base into $branch (#$pr) as $sha"
+              merged[$sha]=$branch
+              queue+=("$branch")
+            done <<<"$prs"
+          done
 
           if [ ${#merged[@]} -gt 0 ]; then
             for _ in $(seq 1 18); do
