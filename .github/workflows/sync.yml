@@ -16,4 +16,3 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/merges" \
             -f base=RELEASE-test -f head=main \
             -f commit_message="Merge branch 'main' into RELEASE-test"
-          gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref RELEASE-test
