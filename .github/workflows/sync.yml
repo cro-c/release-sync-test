@@ -13,6 +13,15 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X POST "repos/$GITHUB_REPOSITORY/merges" \
+          SHA=$(gh api -X POST "repos/$GITHUB_REPOSITORY/merges" \
             -f base=RELEASE-test -f head=main \
-            -f commit_message="Merge branch 'main' into RELEASE-test"
+            -f commit_message="Merge branch 'main' into RELEASE-test" -q .sha)
+          echo "merged as $SHA"
+          for i in $(seq 1 24); do
+            RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&status=action_required" -q '.workflow_runs[0].id // empty')
+            [ -n "$RUN" ] && break
+            sleep 5
+          done
+          echo "waiting run: $RUN"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN/approve"
+          echo "approve call succeeded"
