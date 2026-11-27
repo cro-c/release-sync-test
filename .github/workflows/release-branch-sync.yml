@@ -7,7 +7,7 @@ on:
       - "RELEASE-*"
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -23,23 +23,25 @@ jobs:
       GH_REPO: ${{ github.repository }}
       PUSHED_BRANCH: ${{ github.ref_name }}
     steps:
-      - name: Merge each base into its open release PRs and approve their checks
+      - name: Merge each base into its open release PRs
+        id: merge
         run: |
           set -uo pipefail
           failed=0
-          declare -A merged
+          merged=()
+          conflicts=()
           declare -A visited
           queue=("$PUSHED_BRANCH")
+
+          release_prs=$(gh pr list --state open --limit 200 \
+            --json number,baseRefName,headRefName,isCrossRepository \
+            -q '[.[] | select(.isCrossRepository | not) | select(.headRefName | startswith("RELEASE-"))]')
 
           while [ ${#queue[@]} -gt 0 ]; do
             base=${queue[0]}
             queue=("${queue[@]:1}")
             [ -n "${visited[$base]:-}" ] && continue
             visited[$base]=1
-
-            prs=$(gh pr list --base "$base" --state open --limit 100 \
-              --json number,headRefName,isCrossRepository \
-              -q '.[] | select(.isCrossRepository | not) | select(.headRefName | startswith("RELEASE-")) | "\(.number) \(.headRefName)"')
 
             while read -r pr branch; do
               [ -z "$pr" ] && continue
@@ -49,6 +51,7 @@ jobs:
                   -f commit_message="Merge branch '$base' into $branch" 2>&1); then
                 if [[ "$response" == *"Merge conflict"* ]]; then
                   echo "::warning::$branch (#$pr) conflicts with $base and must be updated manually"
+                  conflicts+=("$pr $branch $base")
                 else
                   echo "::error::$branch (#$pr) could not be updated from $base: $response"
                   failed=1
@@ -63,25 +66,92 @@ jobs:
               fi
 
               echo "Merged $base into $branch (#$pr) as $sha"
-              merged[$sha]=$branch
+              merged+=("$sha $branch")
               queue+=("$branch")
-            done <<<"$prs"
+            done < <(jq -r --arg base "$base" '.[] | select(.baseRefName == $base) | "\(.number) \(.headRefName)"' <<<"$release_prs")
           done
 
-          if [ ${#merged[@]} -gt 0 ]; then
-            for _ in $(seq 1 18); do
-              sleep 10
-              for sha in "${!merged[@]}"; do
-                for run in $(gh api "repos/$GH_REPO/actions/runs?head_sha=$sha&status=action_required" -q '.workflow_runs[].id'); do
-                  if gh api -X POST "repos/$GH_REPO/actions/runs/$run/approve" >/dev/null; then
-                    echo "Approved run $run on ${merged[$sha]}"
-                  else
-                    echo "::error::Could not approve run $run on ${merged[$sha]}"
-                    failed=1
-                  fi
-                done
-              done
-            done
-          fi
+          {
+            echo "merged=$(printf '%s\n' "${merged[@]}" | jq -cR 'select(length > 0) | split(" ") | {sha: .[0], branch: .[1]}' | jq -cs .)"
+            echo "merged_count=${#merged[@]}"
+            echo "conflicts=$(printf '%s\n' "${conflicts[@]}" | jq -cR 'select(length > 0) | split(" ") | {pr: .[0], branch: .[1], base: .[2]}' | jq -cs .)"
+            echo "conflict_count=${#conflicts[@]}"
+          } >> "$GITHUB_OUTPUT"
 
           exit $failed
+
+      - name: Approve the checks waiting on the merge commits
+        if: ${{ !cancelled() && steps.merge.outputs.merged_count > 0 }}
+        env:
+          MERGED: ${{ steps.merge.outputs.merged }}
+        run: |
+          set -uo pipefail
+          failed=0
+          declare -A approved
+          total=$(jq length <<<"$MERGED")
+          idle=0
+
+          for _ in $(seq 1 18); do
+            sleep 10
+            found=0
+            while read -r sha branch; do
+              for run in $(gh api "repos/$GH_REPO/actions/runs?head_sha=$sha&status=action_required" -q '.workflow_runs[].id'); do
+                if gh api -X POST "repos/$GH_REPO/actions/runs/$run/approve" >/dev/null; then
+                  echo "Approved run $run on $branch"
+                  approved[$sha]=1
+                  found=1
+                else
+                  echo "::error::Could not approve run $run on $branch"
+                  failed=1
+                fi
+              done
+            done < <(jq -r '.[] | "\(.sha) \(.branch)"' <<<"$MERGED")
+
+            if [ $found -eq 0 ] && [ ${#approved[@]} -eq "$total" ]; then
+              idle=$((idle + 1))
+              [ $idle -ge 2 ] && break
+            else
+              idle=0
+            fi
+          done
+
+          exit $failed
+
+      - name: Build the Slack message
+        id: slack
+        if: ${{ !cancelled() && steps.merge.outputs.conflict_count > 0 }}
+        env:
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+        run: |
+          payload="$RUNNER_TEMP/release-sync-conflicts.json"
+          jq -n \
+            --argjson conflicts "$CONFLICTS" \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg pushed "$PUSHED_BRANCH" \
+            --arg repo_url "https://github.com/$GH_REPO" \
+            '{
+              channel: $channel,
+              text: "Release branches need a manual update",
+              blocks: [
+                {type: "header", text: {type: "plain_text", text: "⚠️ Release branches need a manual update", emoji: true}},
+                {type: "section", text: {type: "mrkdwn", text: (
+                  "`\($pushed)` changed, but these release branches could not be updated automatically:\n"
+                  + ($conflicts | map("• <\($repo_url)/pull/\(.pr)|#\(.pr)> `\(.branch)` conflicts with `\(.base)`") | join("\n"))
+                )}},
+                {type: "actions", elements: ($conflicts[:25] | map({
+                  type: "button",
+                  text: {type: "plain_text", text: "Open #\(.pr) \(.branch)"},
+                  url: "\($repo_url)/pull/\(.pr)"
+                }))}
+              ]
+            }' > "$payload"
+          echo "payload=$payload" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack about conflicts
+        if: ${{ !cancelled() && steps.slack.outputs.payload != '' }}
+        uses: slackapi/slack-github-action@v4
+        with:
+          token: ${{ secrets.SLACK_DEVOPS_BOT_TOKEN }}
+          method: chat.postMessage
+          payload-file-path: ${{ steps.slack.outputs.payload }}
