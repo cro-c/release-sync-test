@@ -87,7 +87,7 @@ jobs:
         run: |
           set -uo pipefail
           failed=0
-          declare -A approved
+          declare -A approved=()
           total=$(jq length <<<"$MERGED")
           idle=0
 
