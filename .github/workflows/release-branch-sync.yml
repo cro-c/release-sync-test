@@ -1,0 +1,78 @@
+name: Sync master into release branches
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync release branches
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Merge main into open release PRs and approve their checks
+        run: |
+          set -uo pipefail
+          failed=0
+          declare -A merged
+
+          prs=$(gh pr list --base main --state open --limit 100 \
+            --json number,headRefName,isCrossRepository \
+            -q '.[] | select(.isCrossRepository | not) | select(.headRefName | startswith("RELEASE-")) | "\(.number) \(.headRefName)"')
+
+          if [ -z "$prs" ]; then
+            echo "No open RELEASE-* pull requests into main"
+            exit 0
+          fi
+
+          while read -r pr branch; do
+            if ! response=$(gh api -X POST "repos/$GH_REPO/merges" \
+                -f base="$branch" -f head=main \
+                -f commit_message="Merge branch 'main' into $branch" 2>&1); then
+              if [[ "$response" == *"Merge conflict"* ]]; then
+                echo "::warning::$branch (#$pr) conflicts with main and must be updated manually"
+              else
+                echo "::error::$branch (#$pr) could not be updated: $response"
+                failed=1
+              fi
+              continue
+            fi
+
+            sha=$(jq -r '.sha // empty' <<<"$response")
+            if [ -z "$sha" ]; then
+              echo "$branch (#$pr) is already up to date with main"
+              continue
+            fi
+
+            echo "Merged main into $branch (#$pr) as $sha"
+            merged[$sha]=$branch
+          done <<<"$prs"
+
+          if [ ${#merged[@]} -gt 0 ]; then
+            for _ in $(seq 1 18); do
+              sleep 10
+              for sha in "${!merged[@]}"; do
+                for run in $(gh api "repos/$GH_REPO/actions/runs?head_sha=$sha&status=action_required" -q '.workflow_runs[].id'); do
+                  if gh api -X POST "repos/$GH_REPO/actions/runs/$run/approve" >/dev/null; then
+                    echo "Approved run $run on ${merged[$sha]}"
+                  else
+                    echo "::error::Could not approve run $run on ${merged[$sha]}"
+                    failed=1
+                  fi
+                done
+              done
+            done
+          fi
+
+          exit $failed
