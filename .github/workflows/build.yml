@@ -2,8 +2,9 @@ name: Build
 on:
   push:
     branches: ["RELEASE-*"]
+  pull_request:
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Build ran for ${{ github.sha }}, pushed by ${{ github.actor }}"
+      - run: echo "Build ran for ${{ github.sha }}, event ${{ github.event_name }}, pushed by ${{ github.actor }}"
