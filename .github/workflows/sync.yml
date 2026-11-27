@@ -1,0 +1,17 @@
+name: Sync main into release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merges" \
+            -f base=RELEASE-test -f head=main \
+            -f commit_message="Merge branch 'main' into RELEASE-test"

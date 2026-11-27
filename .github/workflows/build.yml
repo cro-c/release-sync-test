@@ -1,0 +1,9 @@
+name: Build
+on:
+  push:
+    branches: ["RELEASE-*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Build ran for ${{ github.sha }}, pushed by ${{ github.actor }}"
