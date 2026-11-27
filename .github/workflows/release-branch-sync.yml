@@ -24,11 +24,16 @@ jobs:
       PUSHED_BRANCH: ${{ github.ref_name }}
     steps:
       - name: Merge each base into its open release PRs and approve their checks
+        id: sync
+        env:
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
           failed=0
           declare -A merged
           declare -A visited
+          conflicts=()
           queue=("$PUSHED_BRANCH")
 
           while [ ${#queue[@]} -gt 0 ]; do
@@ -49,6 +54,7 @@ jobs:
                   -f commit_message="Merge branch '$base' into $branch" 2>&1); then
                 if [[ "$response" == *"Merge conflict"* ]]; then
                   echo "::warning::$branch (#$pr) conflicts with $base and must be updated manually"
+                  conflicts+=("<https://github.com/$GH_REPO/pull/$pr|#$pr> \`$branch\` conflicts with \`$base\`")
                 else
                   echo "::error::$branch (#$pr) could not be updated from $base: $response"
                   failed=1
@@ -84,4 +90,32 @@ jobs:
             done
           fi
 
+          if [ ${#conflicts[@]} -gt 0 ]; then
+            payload="$RUNNER_TEMP/release-sync-conflicts.json"
+            jq -n \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg pushed "$PUSHED_BRANCH" \
+              --arg list "$(printf '• %s\n' "${conflicts[@]}")" \
+              --arg run "$RUN_URL" \
+              '{
+                channel: $channel,
+                text: "Release branches need a manual update",
+                blocks: [
+                  {type: "header", text: {type: "plain_text", text: "⚠️ Release branches need a manual update", emoji: true}},
+                  {type: "section", text: {type: "mrkdwn", text: ("`" + $pushed + "` changed, but these release branches could not be updated automatically:\n" + $list)}},
+                  {type: "section", text: {type: "mrkdwn", text: "Resolve the conflicts by merging the base into the release branch by hand."}},
+                  {type: "actions", elements: [{type: "button", text: {type: "plain_text", text: "View run"}, url: $run}]}
+                ]
+              }' > "$payload"
+            echo "slack_payload=$payload" >> "$GITHUB_OUTPUT"
+          fi
+
           exit $failed
+
+      - name: Notify Slack about conflicts
+        if: ${{ !cancelled() && steps.sync.outputs.slack_payload != '' }}
+        uses: slackapi/slack-github-action@v4
+        with:
+          token: ${{ secrets.SLACK_DEVOPS_BOT_TOKEN }}
+          method: chat.postMessage
+          payload-file-path: ${{ steps.sync.outputs.slack_payload }}
