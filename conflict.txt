@@ -1,1 +1,1 @@
-version from RELEASE-test2
+version from main
